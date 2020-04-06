@@ -1,4 +1,4 @@
-package robolive
+package examples
 
 import java.util.concurrent.{CountDownLatch, TimeUnit}
 
