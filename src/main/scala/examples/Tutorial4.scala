@@ -1,9 +1,9 @@
 package examples
 
-import java.util.concurrent.CountDownLatch
+import java.util.concurrent.{CountDownLatch, ScheduledThreadPoolExecutor, TimeUnit}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
-import org.freedesktop.gstreamer.query.SeekingQuery
+import org.freedesktop.gstreamer.query.{DurationQuery, PositionQuery, SeekingQuery}
 import org.freedesktop.gstreamer.{
   Bus,
   ClockTime,
@@ -20,8 +20,8 @@ final case class CustomData(
   playbin: Element, /* Our one and only element */
   playing: AtomicBoolean, /* Are we in the PLAYING state? */
   terminate: AtomicBoolean, /* Should we terminate execution? */
-  seek_enabled: AtomicBoolean, /* Is seeking enabled for this media? */
-  seek_done: AtomicBoolean, /* Have we performed the seek already? */
+  seekEnabled: AtomicBoolean, /* Is seeking enabled for this media? */
+  seekDone: AtomicBoolean, /* Have we performed the seek already? */
   duration: AtomicLong, /* How long does this media last, in nanoseconds */
 )
 
@@ -53,7 +53,12 @@ final class ApplicationLogic(applicationState: CustomData, latch: CountDownLatch
         val couldBePerformed = applicationState.playbin.query(query)
         if (couldBePerformed) {
           if (query.isSeekable) {
-            println(s"Seeking is enabled from: ${query.getStart} to ${query.getEnd}")
+            println {
+              s"Seeking is enabled " +
+                s"from: ${ClockTime.toSeconds(query.getStart)} " +
+                s"to ${ClockTime.toSeconds(query.getEnd)}"
+            }
+            applicationState.seekEnabled.set(true)
           } else {
             println(s"Seeking is disabled for this stream")
           }
@@ -70,6 +75,54 @@ final class ApplicationLogic(applicationState: CustomData, latch: CountDownLatch
   }
 }
 
+final class UIHandler(applicationState: CustomData) extends Runnable {
+  // taken from: https://github.com/Kurento/gstreamer/blob/master/gst/gstsegment.h
+  private val GST_SEEK_FLAG_FLUSH = 1 << 0
+  private val GST_SEEK_FLAG_KEY_UNIT = 1 << 2
+  override def run(): Unit = {
+    /* Query the current position of the stream */
+    val positionQuery = new PositionQuery(Format.TIME)
+
+    if (!applicationState.playbin.query(positionQuery)) {
+      println("Could not query current position")
+    }
+
+    val currentPosition = positionQuery.getPosition
+
+    /* If we didn't know it yet, query the stream duration */
+    if (!ClockTime.isValid(applicationState.duration.get())) {
+      val durationQuery = new DurationQuery(Format.TIME)
+      if (!applicationState.playbin.query(durationQuery)) {
+        println("Could not query current duration")
+      }
+      applicationState.duration.set(durationQuery.getDuration)
+    }
+    /* Print current position and total duration */
+    println(
+      s"Position " +
+        s"current: ${ClockTime.toSeconds(currentPosition)} " +
+        s"duration: ${ClockTime.toSeconds(applicationState.duration.get())}"
+    )
+
+    /* If seeking is enabled, we have not done it yet, and the time is right, seek */
+    val seekEnabled = applicationState.seekEnabled.get
+    val seekDone = applicationState.seekDone.get()
+    val timeReached = currentPosition > ClockTime.fromSeconds(10)
+    if (seekEnabled && !seekDone && timeReached) {
+      println("Reached 10s, performing seek...")
+      import org.freedesktop.gstreamer.lowlevel.GstElementAPI.GSTELEMENT_API
+      GSTELEMENT_API
+        .gst_element_seek_simple(
+          applicationState.playbin,
+          Format.TIME,
+          GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT,
+          ClockTime.fromSeconds(30)
+        )
+      applicationState.seekDone.set(true)
+    }
+  }
+}
+
 object Tutorial4 extends App {
 
   val latch = new CountDownLatch(1)
@@ -81,8 +134,8 @@ object Tutorial4 extends App {
     playbin = playbin,
     playing = new AtomicBoolean(false),
     terminate = new AtomicBoolean(false),
-    seek_enabled = new AtomicBoolean(false),
-    seek_done = new AtomicBoolean(false),
+    seekEnabled = new AtomicBoolean(false),
+    seekDone = new AtomicBoolean(false),
     duration = new AtomicLong(ClockTime.NONE),
   )
   val applicationLogic = new ApplicationLogic(data, latch)
@@ -105,5 +158,8 @@ object Tutorial4 extends App {
   bus.connect(applicationLogic: Bus.STATE_CHANGED)
   bus.connect(applicationLogic: Bus.DURATION_CHANGED)
 
+  val scheduler = new ScheduledThreadPoolExecutor(1)
+  scheduler.scheduleWithFixedDelay(new UIHandler(data), 0, 100, TimeUnit.MILLISECONDS)
   latch.await()
+  scheduler.shutdown()
 }
